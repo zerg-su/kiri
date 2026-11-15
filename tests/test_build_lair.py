@@ -6,6 +6,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
+import plistlib
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,3 +69,18 @@ class BuilderPolicy(unittest.TestCase):
             file.write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError, 'SHA-256'):
                 self.builder.verify_files(app, {'Contents/MacOS/kiri': digest})
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires real macOS code signing')
+    def test_receipt_binds_the_final_signed_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = Path(folder) / 'Example.app'
+            for name in self.builder.FILES:
+                file = app / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(b'fixture')
+            shutil.copyfile('/usr/bin/true', app / 'Contents/MacOS/kiri')
+            (app / 'Contents/MacOS/kiri').chmod(0o755)
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(dict(
+                CFBundleIdentifier='dev.kiri.app.lair', CFBundleExecutable='kiri', CFBundlePackageType='APPL')))
+            self.builder.seal(app, {'schema': 1, 'source_commit': 'a' * 40}, None)
+            receipt = json.loads(Path(str(app) + '.build.json').read_text())
+            self.builder.verify_files(app, receipt['files'])
+            self.assertNotIn('files', json.loads((app / 'Contents/Resources/lair-build.json').read_text()))

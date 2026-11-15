@@ -94,6 +94,17 @@ def verify_files(app, files):
         checked_hash(app / path, expected)
 
 
+def seal(app, provenance, env):
+    # Signing a bundle changes its main Mach-O signature. Its own raw hash
+    # cannot live inside the sealed Resources without a circular dependency.
+    (app / 'Contents/Resources/lair-build.json').write_text(json.dumps(provenance, indent=2) + '\n')
+    run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/kiri/kiri.entitlements', app], env=env)
+    run(['codesign', '--verify', '--deep', '--strict', app], env=env)
+    receipt = {**provenance, 'files': {name: digest(app / name) for name in FILES}}
+    verify_files(app, receipt['files'])
+    Path(str(app) + '.build.json').write_text(json.dumps(receipt, indent=2) + '\n')
+
+
 def build_env(cache, version):
     # Do not inherit Cargo wrappers, flags, credentials or SSH-agent access.
     env = {k: os.environ[k] for k in ('HOME', 'TMPDIR', 'DEVELOPER_DIR', 'SDKROOT', 'LANG') if k in os.environ}
@@ -220,15 +231,11 @@ def main():
          '-C', 'linker=rust-lld', ROOT / 'tests/isolation-probe.rs', '-o', ROOT / 'target/isolation-probe'], env=env)
     result = isolation(app, profile, env)
     validate_source(ROOT, args.expected_commit)
-    files = {name: digest(app / name) for name in FILES}
-    verify_files(app, files)
     receipt = {'schema': 1, 'source_commit': args.expected_commit, 'architecture': 'arm64',
                'build_pins_sha256': digest(pins_path), 'rust': rust,
                'lair_profile_sha256': digest(profile), 'capabilities': pins['capabilities'],
-               'isolation': result, 'files': files}
-    (app / 'Contents/Resources/lair-build.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/kiri/kiri.entitlements', app], env=env)
-    run(['codesign', '--verify', '--deep', '--strict', app], env=env)
+               'isolation': result}
+    seal(app, receipt, env)
     print('Verified experimental build: ' + str(app), flush=True)
 
 
