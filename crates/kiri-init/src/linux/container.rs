@@ -123,6 +123,7 @@ struct Prepared {
     /// Capabilities kept, one bit each.
     caps: u64,
     seccomp: bool,
+    seccomp_profile: Option<seccompiler::BpfProgram>,
     no_new_privs: bool,
     readonly_rootfs: bool,
     shm_size: u64,
@@ -265,6 +266,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     if !device_filtered {
         prepared.caps &= !(1 << super::devices::CAP_MKNOD);
     }
+    prepared.seccomp_profile = host.seccomp.as_deref()
+        .map(|text| super::seccomp_profile::compile(text, prepared.caps)).transpose().map_err(cleanup)?;
     if spec.limits.shm_size > 0 {
         prepared.shm_size = spec.limits.shm_size;
     }
@@ -359,6 +362,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
         veths.push(host_if);
         if embedded_dns {
+            net.dns.set_internal(spec.net.bridge, plug.internal);
             // An IPv6-only network's bridge has no IPv4 address to serve on,
             // and its containers no A records.
             if !plug.no_ipv4 {
@@ -458,6 +462,8 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths) -> io::
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps)?;
     // The container's ulimits and groups apply to its execs too, as with runc.
     let host = super::hostopts::parse(spec.opts)?;
+    prepared.seccomp_profile = host.seccomp.as_deref()
+        .map(|text| super::seccomp_profile::compile(text, prepared.caps)).transpose()?;
     prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, nodes: Vec::new() };
     let (parent_io, child_io) = stdio(&prepared)?;
     let args = CloneArgs {
@@ -713,6 +719,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         privileged: flags & run_flags::PRIVILEGED != 0,
         caps: if caps == 0 { default_caps() } else { caps },
         seccomp: flags & (run_flags::PRIVILEGED | run_flags::NO_SECCOMP) == 0,
+        seccomp_profile: None,
         no_new_privs: flags & run_flags::NO_NEW_PRIVS != 0,
         readonly_rootfs: flags & run_flags::READONLY_ROOTFS != 0,
         shm_size: 64 << 20,
@@ -1222,7 +1229,11 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // While still root with CAP_SYS_ADMIN, which installing a filter needs.
     // Without the default profile the host boundary stays: vsock is not
     // namespaced, and privileges inside the VM are no reason to reach the host.
-    super::seccomp::install(p.seccomp.then_some(p.caps)).unwrap_or_else(|e| fail("seccomp", e));
+    let defaults = (p.seccomp && p.seccomp_profile.is_none()).then_some(p.caps);
+    super::seccomp::install(defaults).unwrap_or_else(|e| fail("seccomp", e));
+    if let Some(profile) = &p.seccomp_profile {
+        super::seccomp::install_custom(profile).unwrap_or_else(|e| fail("custom seccomp", e));
+    }
     let (uid, gid) = resolve_user(&p.user).unwrap_or_else(|e| fail("user", e));
     // The user's /etc/group memberships and --group-add, as Docker gives them.
     let groups = super::hostopts::supplementary_groups(&p.user, uid, &p.host.groups).unwrap_or_else(|e| fail("groups", e));

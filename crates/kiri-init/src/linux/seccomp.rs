@@ -233,6 +233,18 @@ pub fn install(caps: Option<u64>) -> io::Result<()> {
     Ok(())
 }
 
+/// Load the caller's profile without forcing no_new_privs: like the default
+/// filter, this runs while the trusted child still holds CAP_SYS_ADMIN.
+/// The mandatory host-boundary filter has already been installed.
+pub fn install_custom(insns: &[seccompiler::sock_filter]) -> io::Result<()> {
+    if insns.is_empty() { return Ok(()); }
+    let prog = libc::sock_fprog { len: insns.len() as u16, filter: insns.as_ptr().cast::<libc::sock_filter>().cast_mut() };
+    // SAFETY: the valid program and its instructions outlive this syscall.
+    let ret = unsafe { libc::syscall(libc::SYS_seccomp, 1, SECCOMP_FILTER_FLAG_SPEC_ALLOW, &prog) };
+    if ret != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

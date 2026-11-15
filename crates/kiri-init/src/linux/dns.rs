@@ -3,7 +3,7 @@
 //! resolv.conf names, as with Docker), and on each bridge's gateway address,
 //! port 53. Container names and aliases on the container's networks resolve
 //! to their addresses (A, and AAAA on an IPv6 network); everything else is
-//! forwarded to the VM's upstream resolver (or the container's own `--dns`
+//! forwarded only from non-internal networks to the VM's upstream resolver (or the container's own `--dns`
 //! servers) and the answer relayed back. The 127.0.0.11 socket is opened in
 //! the container's namespace by this agent, so no process runs in there.
 //!
@@ -94,6 +94,9 @@ type Owned6 = Vec<([u8; 4], [u8; 16])>;
 #[derive(Default)]
 pub struct Dns {
     servers: Vec<Server>,
+    /// Unknown networks fail closed. A container may forward only while it
+    /// belongs to a network explicitly configured as non-internal.
+    internal: HashMap<String, bool>,
     /// bridge → name (lowercase) → addresses.
     names: HashMap<String, HashMap<String, Vec<[u8; 4]>>>,
     /// bridge → name → (the container's IPv4 address there, its IPv6 one):
@@ -143,12 +146,27 @@ fn send_to(fd: RawFd, data: &[u8], to: &libc::sockaddr_in) {
 }
 
 impl Dns {
+    pub fn set_internal(&mut self, bridge: &str, internal: bool) {
+        self.internal.insert(bridge.to_owned(), internal);
+        self.forget_pending();
+    }
+
+    fn can_forward(&self, server: usize) -> bool {
+        self.servers[server].bridges.iter().any(|b| self.internal.get(b) == Some(&false))
+    }
+
     /// Starts answering on a bridge's gateway address (once per bridge).
     pub fn serve(&mut self, bridge: &str, gateway: [u8; 4]) -> io::Result<()> {
         if self.servers.iter().any(|s| s.container.is_none() && s.bridges.iter().any(|b| b == bridge)) {
             return Ok(());
         }
         let sock = bound(gateway)?;
+        // A query to an external bridge's address can arrive through an
+        // internal bridge as local host traffic, bypassing forwarding rules.
+        // Only this bridge may use its gateway's DNS service.
+        let device = std::ffi::CString::new(bridge).map_err(|_| io::Error::other("invalid DNS bridge"))?;
+        sys::check(unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+            device.as_ptr().cast(), device.as_bytes_with_nul().len() as u32) } as _, "dns bind device")?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
         Ok(())
     }
@@ -174,6 +192,7 @@ impl Dns {
         for s in self.servers.iter_mut().filter(|s| s.container.is_some_and(|(p, _)| p == pid)) {
             s.bridges.retain(|b| b != bridge);
         }
+        self.forget_pending();
     }
 
     /// Container `pid` is gone: its 127.0.0.11 server goes.
@@ -186,7 +205,9 @@ impl Dns {
     /// descriptor never gets another server's answers.
     fn forget_pending(&mut self) {
         let servers = &self.servers;
-        self.pending.retain(|p| servers.iter().any(|s| s.sock.as_raw_fd() == p.server));
+        let internal = &self.internal;
+        self.pending.retain(|p| servers.iter().any(|s| s.sock.as_raw_fd() == p.server
+            && s.bridges.iter().any(|b| internal.get(b) == Some(&false))));
     }
 
     pub fn register(&mut self, bridge: &str, names: impl Iterator<Item = impl AsRef<str>>, ip: [u8; 4]) {
@@ -218,6 +239,7 @@ impl Dns {
         }
         self.names.remove(bridge);
         self.names6.remove(bridge);
+        self.internal.remove(bridge);
         self.forget_pending();
     }
 
@@ -318,7 +340,7 @@ impl Dns {
         // The host's names answer A with the host's address, and AAAA with
         // no records: the host relay is IPv4 only.
         let addrs = match addrs {
-            None if addrs6.is_none() && HOST_NAMES.contains(&name.as_str()) => Some(&host),
+            None if self.can_forward(server) && addrs6.is_none() && HOST_NAMES.contains(&name.as_str()) => Some(&host),
             a => a,
         };
         // A container name with no address of the asked type is NODATA, not
@@ -351,6 +373,17 @@ impl Dns {
     }
 
     fn forward(&mut self, server: usize, q: &[u8], client: libc::sockaddr_in, upstream: &[[u8; 4]]) {
+        if !self.can_forward(server) {
+            // Reply REFUSED locally. Neither explicit --dns, the VM's
+            // upstream nor the vsock fallback may bypass an internal network.
+            if let Some((_, _, end)) = parse_question(q) {
+                let mut reply = q[..end].to_vec();
+                reply[2..4].copy_from_slice(&[0x81, 0x85]);
+                reply[6..12].fill(0);
+                send_to(self.servers[server].sock.as_raw_fd(), &reply, &client);
+            }
+            return;
+        }
         let now = Instant::now();
         self.pending.retain(|p| now.duration_since(p.sent) < FORWARD_TIMEOUT);
         let key = self.servers[server].container.map_or(client.sin_addr.s_addr.to_ne_bytes(), |(_, owner)| owner);
@@ -585,8 +618,55 @@ mod tests {
     use super::{Dns, Pending, Server, response_matches, udp_socket};
 
     #[test]
-    fn host_names_answer_on_every_network() {
+    fn internal_network_keeps_peer_dns_and_refuses_host_and_external_names() {
+        use std::net::UdpSocket;
+        let mut dns = Dns { relay: true, ..Default::default() };
+        dns.set_internal("inside", true);
+        dns.servers.push(Server { bridges: vec!["inside".into()], sock: udp_socket().unwrap(), container: None });
+        dns.register("inside", ["peer"].iter(), [10, 42, 0, 3]);
+        assert!(dns.answer(0, &query("peer", 1)).is_some());
+        assert!(dns.answer(0, &query("host.docker.internal", 1)).is_none());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        // Even the container's explicit resolver cannot open a host-side path.
+        dns.set_upstream(addr.ip().octets(), vec![[1, 1, 1, 1]]);
+        dns.forward(0, &query("example.com", 1), super::sockaddr(addr.ip().octets(), addr.port()), &[[8, 8, 8, 8]]);
+        let mut reply = [0; 512];
+        let n = client.recv(&mut reply).unwrap();
+        assert!(n >= 12);
+        assert_eq!(reply[3] & 15, 5, "REFUSED, answered locally");
+        assert!(dns.pending.is_empty());
+        assert!(dns.relay_down_until.is_none(), "the host relay was never attempted");
+    }
+
+    #[test]
+    fn last_external_disconnect_revokes_dns_and_pending_queries() {
+        use std::os::fd::AsRawFd;
         let mut dns = Dns::default();
+        dns.servers.push(Server { bridges: vec!["inside".into()], sock: udp_socket().unwrap(), container: Some((42, [10, 42, 0, 2])) });
+        assert!(!dns.can_forward(0), "unknown networks fail closed");
+        dns.set_internal("inside", true);
+        dns.set_internal("outside", false);
+        dns.servers[0].bridges.push("outside".into());
+        assert!(dns.can_forward(0));
+        let mut p = pending();
+        p.server = dns.servers[0].sock.as_raw_fd();
+        dns.pending.push(p);
+        dns.leave(42, "outside");
+        assert!(!dns.can_forward(0));
+        assert!(dns.pending.is_empty(), "a late host answer cannot cross the revoked boundary");
+    }
+
+    fn external_dns() -> Dns {
+        let mut dns = Dns::default();
+        for bridge in ["kiri0", "kiri1", "kiri2"] { dns.set_internal(bridge, false); }
+        dns
+    }
+
+    #[test]
+    fn host_names_answer_on_external_networks() {
+        let mut dns = external_dns();
         dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: None });
         let q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04host\x06docker\x08internal\x00\x00\x01\x00\x01";
         let r = dns.answer(0, q).expect("answered, not forwarded");
@@ -604,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_containers_server_answers_for_each_of_its_networks() {
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         dns.servers.push(Server { bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some((42, [10, 5, 0, 2])) });
         dns.register("kiri1", ["web"].iter(), [10, 5, 0, 3]);
         dns.register("kiri2", ["db"].iter(), [10, 6, 0, 3]);
@@ -650,7 +730,7 @@ mod tests {
         let resolver = bind([127, 0, 0, 2], 53);
         let server = bind([127, 0, 0, 3], 0);
         let client = bind([127, 0, 0, 1], 0);
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: server, container: None });
         let server_fd = dns.servers[0].sock.as_raw_fd();
         let to = name(server_fd);
@@ -679,7 +759,7 @@ mod tests {
 
     #[test]
     fn own_servers_go_with_the_container() {
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         dns.set_upstream([10, 5, 0, 2], vec![[8, 8, 8, 8]]);
         assert_eq!(dns.clients.get(&[10, 5, 0, 2]), Some(&vec![[8, 8, 8, 8]]));
         dns.unregister("kiri1", [10, 5, 0, 2]);
@@ -718,7 +798,7 @@ mod tests {
 
     #[test]
     fn names_answer_a_and_aaaa() {
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         // A server needs a socket; any UDP socket stands in for the bridge's.
         dns.servers.push(super::Server { bridges: vec!["kiri1".into()], sock: super::udp_socket().unwrap(), container: None });
         dns.register("kiri1", ["web", "Alias"].iter(), [10, 5, 0, 2]);
@@ -763,7 +843,7 @@ mod tests {
 
     #[test]
     fn one_client_cant_take_every_forwarded_slot() {
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         dns.servers.push(Server { bridges: vec!["kiri0".into()], sock: udp_socket().unwrap(), container: None });
         let client = super::sockaddr([172, 17, 0, 2], 4000);
         for _ in 0..super::MAX_PER_CLIENT {
@@ -802,7 +882,7 @@ mod tests {
 
     #[test]
     fn only_lookups_the_vm_resolver_may_miss_wait_for_the_host() {
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         assert_eq!(dns.timeout_ms(), -1, "nothing pending");
         dns.pending.push(pending());
         assert_eq!(dns.timeout_ms(), -1, "--dns servers are not second-guessed");
@@ -826,7 +906,7 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
-        let mut dns = Dns::default();
+        let mut dns = external_dns();
         dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: None });
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the pair.

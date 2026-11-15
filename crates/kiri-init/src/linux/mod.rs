@@ -13,6 +13,7 @@ mod netlink;
 mod pid1;
 mod relay;
 mod seccomp;
+mod seccomp_profile;
 mod sys;
 mod transport;
 mod usb;

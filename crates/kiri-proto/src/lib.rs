@@ -36,8 +36,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// `InputConsumed`, which the host waits on, so an older agent would leave
 /// a client's stdin blocked after `INPUT_WINDOW` bytes. 4 added
 /// `UsageQuery`, which has no reply: an older agent's "unexpected" error
-/// would be taken as the reply to the next request.
-pub const PROTOCOL: u16 = 4;
+/// would be taken as the reply to the next request. 5 requires the guest's
+/// custom seccomp profiles and internal-network DNS policy. Do not advertise
+/// these guarantees while running a guest from an earlier bundle.
+pub const PROTOCOL: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {

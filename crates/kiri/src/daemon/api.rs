@@ -410,6 +410,7 @@ fn info(engine: &Engine) -> Value {
         "ServerVersion": ENGINE_VERSION,
         "KiriVersion": env!("CARGO_PKG_VERSION"),
         "OperatingSystem": "Kiri",
+        "Labels": ["io.kiri.security.seccomp-profiles=1", "io.kiri.security.internal-dns=1"],
         "OSType": "linux",
         "Architecture": std::env::consts::ARCH,
         "KernelVersion": kernel_version(),
@@ -1605,6 +1606,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if spec.auto_remove && spec.restart.name != "no" {
         return Err(Error::BadRequest("can't create 'AutoRemove' container with restart policy".into()));
     }
+    super::seccomp::profile(&spec.security_opt)?;
     let id = engine.create(req.query("name").map(str::to_owned), spec, &image)?;
     Ok(json!({"Id": id, "Warnings": warnings}))
 }

@@ -289,7 +289,11 @@ impl Spec {
     /// The guest's `opts` lines for a start or an exec. `net_host`: it runs
     /// in the VM's (or host's) network namespace.
     pub fn guest_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
-        super::hostopts::guest_lines(&self.host_opts, net_host).map_err(Error::BadRequest)
+        let mut lines = super::hostopts::guest_lines(&self.host_opts, net_host).map_err(Error::BadRequest)?;
+        if let Some(profile) = super::seccomp::profile(&self.security_opt)? {
+            lines.push(format!("seccomp\t{profile}"));
+        }
+        Ok(lines)
     }
 
     /// Whether `--sysctl net.ipv6.conf.{all,default,<ifname>}.disable_ipv6=1`
@@ -2977,7 +2981,7 @@ impl Engine {
             let (container_id, config) = (e.container_id.clone(), e.config.clone());
             let (security, caps) = st.containers.get(&container_id).map(|c| (c.spec.security_flags() & !run_flags::READONLY_ROOTFS, c.spec.caps)).unwrap_or_default();
             // Execs get the container's ulimits and groups, as with runc.
-            let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
+            let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false)).transpose()?.unwrap_or_default();
             exec_security = (security, caps, opts);
             let mut env = st.containers.get(&container_id).map(|c| c.spec.env.clone()).unwrap_or_default();
             for e in &config.env {
