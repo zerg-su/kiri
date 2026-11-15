@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "architectures": ["arm64"],
+  "rust": "1.100.0",
+  "rust_manifest_sha256": "3051e859570f64a8c5acb9d09e87425db52c7d97287c67e8f6d57d7d34ef9258",
+  "rustup": {
+    "version": "1.29.3",
+    "url": "https://static.rust-lang.org/rustup/archive/1.29.3/aarch64-apple-darwin/rustup-init",
+    "sha256": "63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f"
+  },
+  "guest_base": {
+    "version": "0.2.1",
+    "url": "https://download.runkiri.com/Kiri-0.2.1-arm64.tar.gz",
+    "sha256": "7be1c28b08f2e74ac2ef4f8972a3da951f89a4e35f10a461dcecb0fad9b94af2",
+    "team_id": "Z44N5GDT9Q"
+  },
+  "capabilities": ["io.kiri.security.seccomp-profiles=1", "io.kiri.security.internal-dns=1"]
+}

@@ -193,7 +193,7 @@ fn guest(root: &Path, arch: Arch) -> io::Result<()> {
     run(Command::new(env!("CARGO"))
         .current_dir(root)
         .env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld")
-        .args(["build", "--release", "-p", "kiri-init", "--target", target]))?;
+        .args(["build", "--locked", "--release", "-p", "kiri-init", "--target", target]))?;
     let init = fs::read(root.join("target").join(target).join("release/kiri-init"))?;
 
     // Uncompressed on purpose: it is small, and the kernel skips decompression.
@@ -264,7 +264,7 @@ fn disk(root: &Path) -> io::Result<()> {
 
 fn host(root: &Path, arch: Arch) -> io::Result<()> {
     let mut build = Command::new(env!("CARGO"));
-    build.current_dir(root).args(["build", "--release", "-p", "kiri"]);
+    build.current_dir(root).args(["build", "--locked", "--release", "-p", "kiri"]);
     if !arch.native() {
         build.args(["--target", arch.host_target()]);
     }

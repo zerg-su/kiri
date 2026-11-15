@@ -1,4 +1,5 @@
 /target
+__pycache__/
 # Raw benchmark output: kept outside this repository.
 /bench/results/
 /guest/out/

@@ -187,5 +187,11 @@ if __name__ == '__main__':
     parser.add_argument('--docker', default='docker')
     parser.add_argument('--probe', help='static Linux executable built from tests/isolation-probe.rs')
     parser.add_argument('--lair-profile', help='optional Docker seccomp JSON used by Lair')
+    parser.add_argument('--report', type=Path, help='write structured test results')
     OPTIONS, rest = parser.parse_known_args()
-    unittest.main(argv=[__file__, *rest])
+    program = unittest.main(argv=[__file__, *rest], exit=False)
+    result = program.result
+    if OPTIONS.report:
+        OPTIONS.report.write_text(json.dumps({'successful': result.wasSuccessful(), 'tests_run': result.testsRun,
+            'failures': len(result.failures), 'errors': len(result.errors), 'skipped': len(result.skipped)}))
+    raise SystemExit(not result.wasSuccessful())
